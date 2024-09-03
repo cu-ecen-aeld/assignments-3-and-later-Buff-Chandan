@@ -39,7 +39,7 @@ mkdir -p $(dirname $writefile)
 touch $writefile 
 
 # Verifying is file creared
-if [ -f $writefile ]	
+if [[ -f $writefile ]]
 then
 	echo "$writestr" > "$writefile"
 	#exit with value 0
