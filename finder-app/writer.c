@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
     ssize_t bytes_written = write(fd, writestr, strlen(writestr));
 
     // Handling write failure
-    if (bytes_written =/home/chandan/Documents/test= -1)
+    if (bytes_written == -1)
     {
         syslog(LOG_ERR, "Failed to write to file '%s'\n", filepath);
         close(fd);
