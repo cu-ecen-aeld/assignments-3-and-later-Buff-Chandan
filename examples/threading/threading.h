@@ -7,21 +7,12 @@
  * It should be returned by your thread so it can be freed by
  * the joiner thread.
  */
-struct thread_data{
-    /*
-     * TODO: add other values your thread will need to manage
-     * into this structure, use this structure to communicate
-     * between the start_thread_obtaining_mutex function and
-     * your thread implementation.
-     */
-
-    /**
-     * Set to true if the thread completed with success, false
-     * if an error occurred.
-     */
-    bool thread_complete_success;
+struct thread_data {
+    pthread_mutex_t* mutex;        // Mutex for synchronization
+    int delay_before_lock_ms;      // Time in milliseconds before trying to lock the mutex
+    int hold_mutex_duration_ms;    // Time in milliseconds to hold the mutex before unlocking
+    bool thread_complete_success;  // Flag to indicate successful thread completion
 };
-
 
 /**
 * Start a thread which sleeps @param wait_to_obtain_ms number of milliseconds, then obtains the
@@ -37,4 +28,5 @@ struct thread_data{
 * coresponding to the thread which was started.
 * @return true if the thread could be started, false if a failure occurred.
 */
-bool start_thread_obtaining_mutex(pthread_t *thread, pthread_mutex_t *mutex,int wait_to_obtain_ms, int wait_to_release_ms);
+bool start_thread_obtaining_mutex(pthread_t *thread, pthread_mutex_t *mutex, int delay_before_lock_ms, int hold_mutex_duration_ms);
+
