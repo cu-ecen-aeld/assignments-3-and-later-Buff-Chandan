@@ -65,7 +65,7 @@ do
     writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
 
-# Run the finder script using the files created and capture the output
+# Run the finder script using the files created and capture the output.
 OUTPUTSTRING=$(finder.sh "$WRITEDIR" "$WRITESTR")
 
 # Clean up the temporary directory
