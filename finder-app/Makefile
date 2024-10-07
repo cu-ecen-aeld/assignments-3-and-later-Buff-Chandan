@@ -1,9 +1,11 @@
-CFLAGS=-Wall -Werror
+TARGET := writer
 
-all : writer
+all: $(TARGET)
 
-writer: writer.o
-	$(CC) $(CFLAGS)  writer.c -o writer
-	chmod +x writer
+$(TARGET): writer.c
+	$(CC) $< -o $@
+	chmod +x $@
 clean:
-	-rm -rf *.o writer
+	-rm -rf $(TARGET) 
+
+.PHONY: clean
