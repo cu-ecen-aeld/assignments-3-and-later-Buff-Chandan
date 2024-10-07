@@ -2,7 +2,7 @@
  * File Name: aesdsocket.c
  * Author: Chandan Mohanta
  * Subject: Advanced Embedded Systems Design (AESD)
- *
+ * References: lecture and slides
  * Description:
  * A network socket server that listens on port 9000, accepts client connections, logs received data to a file, and sends it back.
  * Supports daemon mode and handles SIGINT/SIGTERM for shutdown.
