@@ -1,11 +1,9 @@
-CC=gcc
-
 CFLAGS=-Wall -Werror
 
 all : writer
 
 writer: writer.o
-	$(CROSS_COMPILE)$(CC) $(CFLAGS)  writer.c -o writer
-
+	$(CC) $(CFLAGS)  writer.c -o writer
+	chmod +x writer
 clean:
 	-rm -rf *.o writer
