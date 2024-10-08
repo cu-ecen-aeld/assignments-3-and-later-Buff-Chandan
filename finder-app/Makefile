@@ -1,11 +1,11 @@
-CC=gcc
+TARGET := writer
 
-CFLAGS=-Wall -Werror
+all: $(TARGET)
 
-all : writer
-
-writer: writer.o
-	$(CROSS_COMPILE)$(CC) $(CFLAGS)  writer.c -o writer
-
+$(TARGET): writer.c
+	$(CC) $< -o $@
+	chmod +x $@
 clean:
-	-rm -rf *.o writer
+	-rm -rf $(TARGET) 
+
+.PHONY: clean
