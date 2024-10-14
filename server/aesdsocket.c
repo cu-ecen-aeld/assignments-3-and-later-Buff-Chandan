@@ -1,12 +1,11 @@
-/**************************************************************************************************
+/**********************************
  * File Name: aesdsocket.c
  * Author: Chandan Mohanta
  * Subject: Advanced Embedded Systems Design (AESD)
- * References: lecture and slides
+ * References: lecture and slides	
  * Description:
- * A network socket server that listens on port 9000, accepts client connections, logs received data to a file, and sends it back.
- * Supports daemon mode and handles SIGINT/SIGTERM for shutdown.
- **************************************************************************************************/
+ * Continued for Assignment_6
+ **********************************/
 
 #include <stdio.h>
 #include <sys/socket.h>
@@ -22,16 +21,32 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <time.h>
+#include "queue.h"
 
 /* Configuration defines */
 #define SERVER_PORT        "9000"
-#define DATA_FILE_PATH     "/var/tmp/aesd_socket_data"
+#define DATA_FILE_PATH     "/var/tmp/aesdsocketdata"
 #define BUFFER_LENGTH      1024
+#define TIMESTAMP_INTERVAL 10  // 10 seconds interval for timestamp
+#define RFC2822_FORMAT     "%a, %d %b %Y %H:%M:%S %z"
 
 /* Global variables */
 int shutdown_flag = 0;
 int daemon_mode_enabled = 0;
-int server_socket_fd = -1, client_socket_fd = -1, data_file_fd = -1;
+int server_socket_fd = -1, data_file_fd = -1;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for file access
+
+/* Thread management using queue.h */
+typedef struct socket_thread {
+    pthread_t thread_id;
+    int client_socket_fd;
+    bool thread_complete;
+    SLIST_ENTRY(socket_thread) entries; // For the singly linked list
+} socket_thread_t;
+
+SLIST_HEAD(socket_thread_list, socket_thread) thread_list_head;  // List of threads
 
 /* Function declarations */
 void handle_signal(int signal_number);
@@ -39,15 +54,19 @@ void terminate_program(int status_code);
 void initiate_daemon_mode();
 void configure_signal_handling();
 void initialize_socket();
-void process_connection();
 void bind_and_start_listening(struct addrinfo *server_info);
-void accept_client_and_handle_data();
-void manage_client_data();
+void *handle_client_connection(void *client_socket_fd);
+void manage_client_data(int client_socket_fd);
 void setup_daemon_mode();
+void *timestamp_thread(void *arg);
+void join_and_cleanup_threads();
 
 int main(int argc, char *argv[]) 
 {
     openlog(NULL, 0, LOG_USER); /* Initialize syslog */
+    
+    /* Initialize the SLIST head */
+    SLIST_INIT(&thread_list_head);
 
     /* Check for -d parameter to enable daemon mode */
     if ((argc == 2) && (strcmp(argv[1], "-d") == 0))
@@ -61,11 +80,48 @@ int main(int argc, char *argv[])
 
     setup_daemon_mode();         /* Handle daemon mode if specified */
 
+    /* Create thread for appending timestamps every 10 seconds */
+    pthread_t timestamp_thread_id;
+    if (pthread_create(&timestamp_thread_id, NULL, timestamp_thread, NULL) != 0) {
+        syslog(LOG_ERR, "[ERROR] Failed to create timestamp thread.");
+        terminate_program(EXIT_FAILURE);
+    }
+
     /* Main server loop */
     while (!shutdown_flag)
     {
-        accept_client_and_handle_data(); /* Handle each client connection */
+        struct sockaddr_in client_address;
+        socklen_t client_address_len = sizeof(client_address);
+        int client_socket = accept(server_socket_fd, (struct sockaddr*)&client_address, &client_address_len);
+
+        if (client_socket == -1) {
+            syslog(LOG_WARNING, "[WARNING] Accepting connection failed, retrying...");
+            continue;
+        }
+
+        /* Spawn a new thread to handle the connection */
+        socket_thread_t *new_thread = (socket_thread_t *)malloc(sizeof(socket_thread_t));
+        if (new_thread == NULL) {
+            syslog(LOG_ERR, "[ERROR] Failed to allocate memory for new thread.");
+            close(client_socket);
+            continue;
+        }
+
+        new_thread->client_socket_fd = client_socket;
+        new_thread->thread_complete = false;
+
+        /* Add the new thread to the list */
+        SLIST_INSERT_HEAD(&thread_list_head, new_thread, entries);
+
+        if (pthread_create(&new_thread->thread_id, NULL, handle_client_connection, (void *)(intptr_t)client_socket) != 0) {
+            syslog(LOG_ERR, "[ERROR] Failed to create thread for client connection.");
+            close(client_socket);
+            free(new_thread);
+        }
     }
+
+    /* Join and clean up all threads before exiting */
+    join_and_cleanup_threads();
 
     terminate_program(EXIT_SUCCESS); /* Clean exit */
 }
@@ -149,31 +205,37 @@ void setup_daemon_mode()
     }
 }
 
-/* Function to accept client connections and handle data */
-void accept_client_and_handle_data()
+/* Function to handle each client connection */
+void *handle_client_connection(void *client_socket_fd)
 {
-    struct sockaddr_in client_address;
-    socklen_t client_address_len = sizeof(client_address);
-    client_socket_fd = accept(server_socket_fd, (struct sockaddr*)&client_address, &client_address_len);
-    if (client_socket_fd == -1)
-    {
-        syslog(LOG_WARNING, "[WARNING] Accepting connection failed, retrying...");
-        return; /* Retry accepting connections */
-    }
-    syslog(LOG_INFO, "[INFO] Connection accepted: %d", client_socket_fd);
+    int socket_fd = (intptr_t)client_socket_fd;
+    manage_client_data(socket_fd);
+    close(socket_fd);
 
-    manage_client_data(); /* Handle incoming client data */
+    /* Mark thread as complete */
+    socket_thread_t *thread;
+    SLIST_FOREACH(thread, &thread_list_head, entries) {
+        if (thread->client_socket_fd == socket_fd) {
+            thread->thread_complete = true;
+            break;
+        }
+    }
+
+    pthread_exit(NULL);
 }
 
 /* Function to process client data and respond */
-void manage_client_data()
+void manage_client_data(int client_socket_fd)
 {
+    pthread_mutex_lock(&file_mutex);  // Lock the mutex before file operations
+
     /* Open file for appending received data */
     data_file_fd = open(DATA_FILE_PATH, O_CREAT | O_RDWR | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     if (data_file_fd == -1)
     {
         syslog(LOG_ERR, "[ERROR] File open failed.");
-        terminate_program(EXIT_FAILURE);
+        pthread_mutex_unlock(&file_mutex);  // Unlock mutex on error
+        return;
     }
 
     char data_buffer[BUFFER_LENGTH] = {'\0'};
@@ -187,14 +249,16 @@ void manage_client_data()
         if (received_data == -1)
         {
             syslog(LOG_ERR, "[ERROR] Data reception failed.");
-            terminate_program(EXIT_FAILURE);
+            pthread_mutex_unlock(&file_mutex);
+            return;
         }
 
         /* Write received data to file */
         if (write(data_file_fd, data_buffer, received_data) != received_data)
         {
             syslog(LOG_ERR, "[ERROR] File write failed.");
-            terminate_program(EXIT_FAILURE);
+            pthread_mutex_unlock(&file_mutex);
+            return;
         }
 
         /* Check for newline indicating end of packet */
@@ -216,7 +280,8 @@ void manage_client_data()
         if (read_data == -1)
         {
             syslog(LOG_ERR, "[ERROR] File read failed.");
-            terminate_program(EXIT_FAILURE);
+            pthread_mutex_unlock(&file_mutex);
+            return;
         }
 
         if (read_data > 0)
@@ -224,14 +289,66 @@ void manage_client_data()
             if (send(client_socket_fd, data_buffer, read_data, 0) != read_data)
             {
                 syslog(LOG_ERR, "[ERROR] Sending data to client failed.");
-                terminate_program(EXIT_FAILURE);
+                pthread_mutex_unlock(&file_mutex);
+                return;
             }
         }
     } while (read_data > 0);
 
     close(data_file_fd); /* Close the data file */
-    close(client_socket_fd); /* Close the client socket */
-    syslog(LOG_INFO, "[INFO] Connection closed.");
+    pthread_mutex_unlock(&file_mutex);  // Unlock the mutex after file operations
+}
+
+/* Timestamp thread function */
+void *timestamp_thread(void *arg)
+{
+    while (!shutdown_flag)
+    {
+        sleep(TIMESTAMP_INTERVAL);  // Wait for 10 seconds
+
+        time_t current_time;
+        struct tm *time_info;
+        char timestamp_buffer[BUFFER_LENGTH];
+
+        time(&current_time);
+        time_info = localtime(&current_time);
+
+        strftime(timestamp_buffer, BUFFER_LENGTH, "timestamp:%a, %d %b %Y %H:%M:%S %z\n", time_info);
+
+        pthread_mutex_lock(&file_mutex);
+
+        data_file_fd = open(DATA_FILE_PATH, O_CREAT | O_RDWR | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        if (data_file_fd == -1)
+        {
+            syslog(LOG_ERR, "[ERROR] File open failed for timestamp.");
+            pthread_mutex_unlock(&file_mutex);
+            continue;
+        }
+
+        if (write(data_file_fd, timestamp_buffer, strlen(timestamp_buffer)) != strlen(timestamp_buffer))
+        {
+            syslog(LOG_ERR, "[ERROR] Failed to write timestamp to file.");
+        }
+
+        close(data_file_fd);
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    pthread_exit(NULL);
+}
+
+/* Function to join and cleanup threads */
+void join_and_cleanup_threads()
+{
+    socket_thread_t *thread, *temp_thread;
+
+    SLIST_FOREACH_SAFE(thread, &thread_list_head, entries, temp_thread) {
+        if (thread->thread_complete) {
+            pthread_join(thread->thread_id, NULL);
+            SLIST_REMOVE(&thread_list_head, thread, socket_thread, entries);
+            free(thread);
+        }
+    }
 }
 
 /* Signal handler for SIGINT and SIGTERM */
@@ -254,14 +371,6 @@ void terminate_program(int status_code)
         syslog(LOG_INFO, "[INFO] Closing server socket: %d", server_socket_fd);
         close(server_socket_fd);
         syslog(LOG_INFO, "[INFO] Server socket closed.");
-    }
-
-    /* Close client socket if open */
-    if (client_socket_fd >= 0) 
-    {
-        syslog(LOG_INFO, "[INFO] Closing client socket: %d", client_socket_fd);
-        close(client_socket_fd);
-        syslog(LOG_INFO, "[INFO] Client socket closed.");
     }
 
     /* Close data file descriptor if open */
