@@ -20,6 +20,8 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -32,7 +34,7 @@ int aesd_open(struct inode *inode, struct file *filp)
 {
     PDEBUG("open");
     /**
-     * TODO: handle open
+     * handle open
      */
     filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
     return 0;
@@ -42,7 +44,7 @@ int aesd_release(struct inode *inode, struct file *filp)
 {
     PDEBUG("release");
     /**
-     * TODO: handle release
+     * handle release
      */
     filp->private_data = NULL;
     return 0;
@@ -59,14 +61,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
-    if ( (filp == NULL) || (buf == NULL))
+    if ((filp == NULL) || (buf == NULL))
     {
         PDEBUG("(AESD_READ)ERROR: invalid arguments");
         return -EINVAL;
     }
-    /**
-     * TODO: handle read
-     */
+
     dev_aesd = filp->private_data;
 
     if (!dev_aesd)
@@ -102,7 +102,6 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 	return -EFAULT;
     }
 
-/* copy_to_user returns '0' on success or number of bytes not copied */
     retval = (read_bytes - retval);
     *f_pos += retval;
     
@@ -113,20 +112,17 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-    //ssize_t retval = -ENOMEM;
     ssize_t retval = 0;
     const char *free_buffptr = NULL;
     struct aesd_dev *dev_aesd = NULL;
 
-    if ( (NULL == filp) || (NULL == buf))
+    if ((NULL == filp) || (NULL == buf))
     {
-        PDEBUG("ERROR: aesd_read invalid arguments");
+        PDEBUG("ERROR: aesd_write invalid arguments");
         return -EINVAL;
     }
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle write
-     */
+
     dev_aesd = filp->private_data;
     if (mutex_lock_interruptible(&dev_aesd->lock))
     {
@@ -135,7 +131,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     }
 
     dev_aesd->entry.buffptr = krealloc(dev_aesd->entry.buffptr, (dev_aesd->entry.size + count),
-                                  GFP_KERNEL);
+                                       GFP_KERNEL);
     if (NULL == dev_aesd->entry.buffptr)
     {
         PDEBUG("(AESD_WRITE)ERROR: Unable to re allocate memory");
@@ -150,7 +146,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         goto exit;
     }
 
-    /* copy_to_user returns '0' on success or number of bytes not copied */
     retval = (count - retval);
     dev_aesd->entry.size += retval;
 
@@ -173,12 +168,140 @@ exit:
     mutex_unlock(&dev_aesd->lock);
     return retval;
 }
+
+/**
+ *Seek to a given offset
+ */
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *dev = NULL;
+    loff_t file_offset = 0;
+    uint8_t index = 0;
+    struct aesd_buffer_entry *entry = NULL;
+    loff_t total_size = 0;
+
+    if (filp == NULL)
+    {
+        PDEBUG("ERROR: aesd_llseek invalid arguments");
+        return -EINVAL;
+    }
+
+    dev = filp->private_data;
+
+    if (mutex_lock_interruptible(&dev->lock) != 0)
+    {
+        PDEBUG("ERROR: mutex_lock_interruptible acquiring lock");
+        return -ERESTARTSYS;
+    }
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&dev->buffer,index)
+    {
+        total_size += entry->size;
+    }
+    mutex_unlock(&dev->lock);
+
+    file_offset = fixed_size_llseek(filp, offset, whence, total_size);
+
+    return file_offset;
+}
+
+/**
+ * Adjust the file offset based on a write_cmd and write_cmd_offset
+ */
+static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, unsigned int write_cmd_offset)
+{
+    struct aesd_dev *dev = NULL;
+    long return_value = 0;
+    uint8_t index = 0;
+    struct aesd_buffer_entry *entry = NULL;
+
+    if (filp == NULL)
+    {
+        PDEBUG("ERROR: aesd_adjust_file_offset invalid arguments");
+        return -EINVAL;
+    }
+
+    dev = filp->private_data;
+
+    if (mutex_lock_interruptible(&dev->lock) != 0)
+    {
+        PDEBUG("ERROR: mutex_lock_interruptible acquiring lock");
+        return -ERESTARTSYS;
+    }
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&dev->buffer,index){}
+
+    if ((write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) ||
+        (write_cmd > index) ||
+        (write_cmd_offset >= dev->buffer.entry[write_cmd].size))
+    {
+        return_value = -EINVAL;
+        goto exit;
+    }
+
+    for (index = 0; index < write_cmd; index++)
+    {
+        filp->f_pos += dev->buffer.entry[index].size;
+    }
+    filp->f_pos += write_cmd_offset;
+
+exit:
+    mutex_unlock(&dev->lock);
+    return return_value;
+}
+
+/*
+ *
+ * Adjust the file offset based on write_cmd and write_cmd_offset.
+ */
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    long return_value = 0;
+    struct aesd_seekto seek_data;
+
+    if (NULL == filp)
+    {
+        PDEBUG("ERROR: aesd_ioctl invalid arguments");
+        return -EINVAL;
+    }
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC)
+    {
+        return -ENOTTY;
+    }
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR)
+    {
+ 	return -ENOTTY;
+    }
+
+    switch (cmd)
+    {
+ 	case AESDCHAR_IOCSEEKTO:
+        if (copy_from_user(&seek_data, (const void __user *)arg, sizeof(seek_data)) != 0)
+        {
+            return_value = -EFAULT;
+        }
+        else
+        {
+            return_value = aesd_adjust_file_offset(filp, seek_data.write_cmd, seek_data.write_cmd_offset);
+        }
+        break;
+
+ 	default:
+ 	return_value = -ENOTTY;
+ 	break;
+    }
+    return return_value;
+}
+
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -195,8 +318,6 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     return err;
 }
 
-
-
 int aesd_init_module(void)
 {
     dev_t dev = 0;
@@ -211,9 +332,7 @@ int aesd_init_module(void)
     }
     memset(&aesd_device,0,sizeof(struct aesd_dev));
 
-    /**
-     * TODO: initialize the AESD specific portion of the device
-     */
+ 
     mutex_init(&aesd_device.lock);
     aesd_circular_buffer_init(&aesd_device.buffer);
 
@@ -233,9 +352,7 @@ void aesd_cleanup_module(void)
 
     cdev_del(&aesd_device.cdev);
 
-    /**
-     * TODO: cleanup AESD specific poritions here as necessary
-     */
+    
     uint8_t index = 0;
     struct aesd_buffer_entry *entry = NULL;
 
@@ -247,14 +364,11 @@ void aesd_cleanup_module(void)
             entry->buffptr = NULL;
         }
     }
-    
+
     mutex_destroy(&aesd_device.lock);
 
     unregister_chrdev_region(devno, 1);
 }
 
-
-
 module_init(aesd_init_module);
 module_exit(aesd_cleanup_module);
-

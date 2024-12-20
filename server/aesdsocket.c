@@ -1,10 +1,7 @@
 /**********************************
  * File Name: aesdsocket.c
  * Author: Chandan Mohanta
- * Subject: Advanced Embedded Systems Design (AESD)
- * References: lecture and slides	
- * Description:
- * Continued for Assignment_6
+ * References: lecture and slides
  **********************************/
 
 /* Header files */
@@ -25,7 +22,7 @@
 #include <pthread.h>
 #include <time.h>
 #include "queue.h"
-
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 /* Configuration and Macro Definitions */
 #define SERVER_PORT            "9000"
@@ -40,8 +37,7 @@
 #define SUCCESS                0
 #define FAILURE               -1
 #define TIMESTAMP_INTERVAL     10
-#define RFC2822_FORMAT         "%a, %d %b %Y %H:%M:%S %z"
-
+#define MATCHED_INPUTS_COUNT   2
 
 /* Global Variables */
 int shutdown_flag = 0;
@@ -68,9 +64,6 @@ void *data_thread(void *thread_node);
 
 /*  
  * Timestamp Thread Function
- * This runs periodically (every TIMESTAMP_INTERVAL seconds) to append
- * timestamp data to the output file. Requires a mutex lock for thread-safe
- * file operations.
  */
 #if (USE_AESD_CHAR_DEVICE == 0)
 void *timestamp_thread(void *thread_node)
@@ -100,7 +93,7 @@ void *timestamp_thread(void *thread_node)
         time_period.tv_sec += TIMESTAMP_INTERVAL;
 
         if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &time_period, NULL) != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to sleep for 10 sec");
+            syslog(LOG_ERR, "ERROR: Failed to sleep for timestamp interval");
             status = FAILURE;
             goto exit_timestamp;
         }
@@ -114,13 +107,13 @@ void *timestamp_thread(void *thread_node)
 
         tm_time = localtime(&curr_time);
         if (tm_time == NULL) {
-            syslog(LOG_ERR, "ERROR: Failed to fill tm struct");
+            syslog(LOG_ERR, "ERROR: Failed to parse current time");
             status = FAILURE;
             goto exit_timestamp;
         }
 
         if (strftime(output, sizeof(output), "timestamp: %Y %B %d, %H:%M:%S\n", tm_time) == SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to convert tm into string");
+            syslog(LOG_ERR, "ERROR: Failed to format timestamp string");
             status = FAILURE;
             goto exit_timestamp;
         }
@@ -128,18 +121,18 @@ void *timestamp_thread(void *thread_node)
         file_fd = open(DATA_FILE_PATH, O_CREAT|O_RDWR|O_APPEND, 
                        S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
         if (file_fd == FAILURE) {
-            syslog(LOG_ERR, "ERROR: Failed to create/open file");
+            syslog(LOG_ERR, "ERROR: Failed to open data file for timestamp");
             status = FAILURE;
             goto exit_timestamp;
         }
 
         if (pthread_mutex_lock(node->thread_mutex) != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to lock mutex");
+            syslog(LOG_ERR, "ERROR: Failed to lock mutex for timestamp write");
             status = FAILURE;
             goto exit_timestamp;
         }
 
-        /* Attempt to write the timestamp to the file */
+        /* Write the timestamp data */
         written_bytes = (int)write(file_fd, output, strlen(output));
         if (written_bytes != (int)strlen(output)) {
             syslog(LOG_ERR, "ERROR: Failed to write timestamp to file");
@@ -149,7 +142,7 @@ void *timestamp_thread(void *thread_node)
         }
 
         if (pthread_mutex_unlock(node->thread_mutex) != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to unlock mutex");
+            syslog(LOG_ERR, "ERROR: Failed to unlock mutex after timestamp write");
             status = FAILURE;
             goto exit_timestamp;
         }
@@ -171,10 +164,6 @@ exit_timestamp:
 
 /*
  * Data Thread Function
- * Handles client connections:
- * 1) Receive data until newline is encountered.
- * 2) Write received data into the file.
- * 3) Read entire file and send back to client.
  */
 void *data_thread(void *thread_node)
 {
@@ -186,6 +175,10 @@ void *data_thread(void *thread_node)
     int status = FAILURE;
     int file_fd = -1;
 
+#if (USE_AESD_CHAR_DEVICE == 1)
+    const char *ioctl_str = "AESDCHAR_IOCSEEKTO:";
+#endif
+
     if (thread_node == NULL) {
         return NULL;
     }
@@ -195,37 +188,60 @@ void *data_thread(void *thread_node)
     file_fd = open(DATA_FILE_PATH, O_CREAT|O_RDWR|O_APPEND, 
                    S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
     if (file_fd == FAILURE) {
-        syslog(LOG_ERR, "ERROR: Failed to create/open file");
+        syslog(LOG_ERR, "ERROR: Failed to open data file");
         status = FAILURE;
         goto exit_data;
     }
 
-    /* Receive data from client until newline is found */
+    /* Receive data until newline found */
     do {
         memset(buffer, 0, BUFFER_LENGTH);
         recv_bytes = (int)recv(node->client_socket_fd, buffer, BUFFER_LENGTH, 0);
         if (recv_bytes == FAILURE) {
-            syslog(LOG_ERR, "ERROR: Failed to receive byte from client");
+            syslog(LOG_ERR, "ERROR: Failed to receive data from client");
             status = FAILURE;
             goto exit_data;
         }
 
+#if (USE_AESD_CHAR_DEVICE == 1)
+        /* Check for ioctl seek command */
+        if (SUCCESS == strncmp(buffer, ioctl_str, strlen(ioctl_str))) {
+            struct aesd_seekto seek_info;
+            if (MATCHED_INPUTS_COUNT != sscanf(buffer, "AESDCHAR_IOCSEEKTO:%d,%d",
+                                               &seek_info.write_cmd,
+                                               &seek_info.write_cmd_offset))
+            {
+                syslog(LOG_ERR, "ERROR: Failed to parse ioctl arguments");
+            }
+            else
+            {
+                if(SUCCESS != ioctl(file_fd, AESDCHAR_IOCSEEKTO, &seek_info))
+                {
+                    syslog(LOG_ERR, "ERROR: ioctl seek failed");
+                }
+            }
+           
+            /* After performing ioctl, jump to read and send phase */
+            goto read_data;
+        }
+#endif
+
         if (pthread_mutex_lock(node->thread_mutex) != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to lock mutex");
+            syslog(LOG_ERR, "ERROR: Failed to lock mutex for data write");
             status = FAILURE;
             goto exit_data;
         }
 
         written_bytes = (int)write(file_fd, buffer, (size_t)recv_bytes);
         if (written_bytes != recv_bytes) {
-            syslog(LOG_ERR, "ERROR: Failed to write data");
+            syslog(LOG_ERR, "ERROR: Failed to write received data");
             status = FAILURE;
             pthread_mutex_unlock(node->thread_mutex);
             goto exit_data;
         }
 
         if (pthread_mutex_unlock(node->thread_mutex) != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to unlock mutex");
+            syslog(LOG_ERR, "ERROR: Failed to unlock mutex after data write");
             status = FAILURE;
             goto exit_data;
         }
@@ -236,40 +252,46 @@ void *data_thread(void *thread_node)
 
     } while (!packet_complete);
 
-    /* Close the file (writing phase done) */
+    /* Close after writing */
     close(file_fd);
+
+#if (USE_AESD_CHAR_DEVICE == 0)
     file_fd = open(DATA_FILE_PATH, O_RDONLY, S_IRUSR | S_IRGRP | S_IROTH);
     if (FAILURE == file_fd) {
-        syslog(LOG_ERR, "Error opening %s file: %s", DATA_FILE_PATH, strerror(errno));
+        syslog(LOG_ERR, "ERROR: Failed to open file in read mode");
         status = FAILURE;
         goto exit_data;
     }
+#else
+    /* For device, just set offset to start if needed */
+    lseek(file_fd, 0, SEEK_SET);
+#endif
 
-    /* Read the entire file and send it back to the client */
-    int read_bytes = 0;
-    int send_bytes = 0;
-    do {
-        memset(buffer, 0, BUFFER_LENGTH);
-        read_bytes = (int)read(file_fd, buffer, BUFFER_LENGTH);
-        if (read_bytes == -1) {
-            syslog(LOG_ERR, "ERROR: Failed to read from file");
-            status = FAILURE;
-            goto exit_data;
-        }
-        syslog(LOG_INFO, "read successful is: %d", read_bytes);
-        syslog(LOG_INFO, "read successful is: %s", buffer);
-
-        if (read_bytes > 0) {
-            send_bytes = (int)send(node->client_socket_fd, buffer, (size_t)read_bytes, 0);
-            if (send_bytes != read_bytes) {
-                syslog(LOG_ERR, "ERROR: Failed to send bytes to client");
+read_data:
+    {
+        /* Read entire file/device and send back */
+        int read_bytes = 0;
+        int send_bytes = 0;
+        do {
+            memset(buffer, 0, BUFFER_LENGTH);
+            read_bytes = (int)read(file_fd, buffer, BUFFER_LENGTH);
+            if (read_bytes == -1) {
+                syslog(LOG_ERR, "ERROR: Failed to read from file/device");
                 status = FAILURE;
                 goto exit_data;
             }
-            status = SUCCESS;
-        }
-    } while (read_bytes > 0);
 
+            if (read_bytes > 0) {
+                send_bytes = (int)send(node->client_socket_fd, buffer, (size_t)read_bytes, 0);
+                if (send_bytes != read_bytes) {
+                    syslog(LOG_ERR, "ERROR: Failed to send data back to client");
+                    status = FAILURE;
+                    goto exit_data;
+                }
+                status = SUCCESS;
+            }
+        } while (read_bytes > 0);
+    }
 
 exit_data:
     if (file_fd != -1) {
@@ -286,28 +308,27 @@ exit_data:
 
 
 /*
- * Signal Handler: Handles SIGINT and SIGTERM to signal a shutdown.
+ * Signal Handler
  */
 void signal_handler(int signo)
 {
     if ((signo == SIGINT) || (signo == SIGTERM)) {
         shutdown_flag = 1;
-        syslog(LOG_DEBUG, "Caught signal, exiting");
+        syslog(LOG_DEBUG, "Caught signal, initiating shutdown");
     }
     printf("FOUND SIGNAL!!!!!!!\n");
 }
 
 
 /*
- * Close and Exit:
- * Closes all open sockets, removes file if necessary, and closes syslog.
+ * Close and Exit
  */
 void close_n_exit(void)
 {
     if (sock_fd >= 0) {
-        syslog(LOG_INFO, "Closing sock_fd: %d", sock_fd);
+        syslog(LOG_INFO, "Closing socket");
         close(sock_fd);
-        syslog(LOG_INFO, "Closed sock_fd: %d", sock_fd);
+        syslog(LOG_INFO, "Socket closed");
     }
 
 #if (USE_AESD_CHAR_DEVICE == 0)
@@ -320,8 +341,7 @@ void close_n_exit(void)
 
 
 /*
- * Daemon Mode Function:
- * Forks the current process and sets it to run as a daemon.
+ * Forks and runs as a daemon.
  */
 int run_as_daemon_func() 
 {
@@ -331,23 +351,23 @@ int run_as_daemon_func()
     pid = fork();
 
     if (pid < 0) {
-        syslog(LOG_ERR, "ERROR: Failed to fork");
+        syslog(LOG_ERR, "ERROR: Fork failed");
         return FAILURE;
     }
     else if (pid > 0) {
-        syslog(LOG_INFO, "Terminating Parent");
+        syslog(LOG_INFO, "Terminating parent after fork");
         exit(SUCCESS);
     }
     else if (pid == 0) {
-        syslog(LOG_INFO, "Created Child Successfully");
+        syslog(LOG_INFO, "Child process running as daemon");
         sid = setsid();
         if (sid < 0) {
-            syslog(LOG_ERR, "ERROR: Failed to setsid");
+            syslog(LOG_ERR, "ERROR: setsid failed");
             return FAILURE;
         }
 
         if ((chdir("/")) < 0) {
-            syslog(LOG_ERR, "ERROR: Failed to chdir");
+            syslog(LOG_ERR, "ERROR: chdir failed");
             return FAILURE;
         }
 
@@ -357,23 +377,23 @@ int run_as_daemon_func()
 
         int fd = open("/dev/null", O_RDWR);
         if (fd == -1) {
-            syslog(LOG_PERROR, "open:%s\n", strerror(errno));
+            syslog(LOG_ERR, "ERROR: open /dev/null failed");
             close(fd);
             return FAILURE;       
         }
 
         if (dup2(fd, STDIN_FILENO)  == -1) {
-            syslog(LOG_PERROR, "dup2:%s\n", strerror(errno));
+            syslog(LOG_ERR, "ERROR: dup2 stdin");
             close(fd);
             return FAILURE;    
         }
         if (dup2(fd, STDOUT_FILENO)  == -1) {
-            syslog(LOG_PERROR, "dup2:%s\n", strerror(errno));
+            syslog(LOG_ERR, "ERROR: dup2 stdout");
             close(fd);
             return FAILURE;    
         }
         if (dup2(fd, STDERR_FILENO)  == -1) {
-            syslog(LOG_PERROR, "dup2:%s\n", strerror(errno));
+            syslog(LOG_ERR, "ERROR: dup2 stderr");
             close(fd);
             return FAILURE;    
         }
@@ -385,12 +405,7 @@ int run_as_daemon_func()
 
 
 /*
- * Main Function:
- * 1) Parses arguments for daemon mode.
- * 2) Sets up signals.
- * 3) Creates and binds a socket.
- * 4) Optionally daemonizes.
- * 5) Accepts client connections and creates threads to handle them.
+ * Main Function
  */
 int main(int argc, char *argv[])
 {
@@ -401,44 +416,43 @@ int main(int argc, char *argv[])
 
     openlog(NULL, 0, LOG_USER);
 
-    /* Check if daemon mode is requested */
+    /* Check if daemon mode requested */
     if ((argc == 2) && (strcmp(argv[1], "-d") == 0)) {
         printf("RUNNING DAEMON\n");
         daemon_mode_enabled = 1;
-        syslog(LOG_INFO, "Running aesdsocket as daemon(background)");
+        syslog(LOG_INFO, "Running in daemon mode");
     }
 
     printf("running aesd socket\n");
 
-    /* Register signal handlers for SIGINT and SIGTERM */
+    /* Register signals */
     struct sigaction sa;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = signal_handler;
 
     if (sigaction(SIGINT, &sa, NULL) != SUCCESS) {
-        syslog(LOG_ERR, "ERROR: Failed to register SIGINT");
+        syslog(LOG_ERR, "ERROR: SIGINT registration failed");
         return FAILURE;
     }
     if (sigaction(SIGTERM, &sa, NULL) != SUCCESS) {
-        syslog(LOG_ERR, "ERROR: Failed to register SIGTERM");
+        syslog(LOG_ERR, "ERROR: SIGTERM registration failed");
         return FAILURE;
     }
-    syslog(LOG_INFO, "Signal Handler registered");
-
+    syslog(LOG_INFO, "Signal handlers registered");
 
     SLIST_HEAD(socket_head, socket_thread) head;
     SLIST_INIT(&head);
 
-    /* Create a socket */
+    /* Create socket */
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd == FAILURE) {
         syslog(LOG_ERR, "ERROR: Failed to create socket");
         return FAILURE;
     }
-    syslog(LOG_INFO, "Socket created successfully: %d", sock_fd);
+    syslog(LOG_INFO, "Socket created successfully");
 
-    /* Prepare hints and get address info */
+    /* Setup address info */
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -447,61 +461,61 @@ int main(int argc, char *argv[])
 
     struct addrinfo *server_addr_info = NULL;
     if (getaddrinfo(NULL, SERVER_PORT, &hints, &server_addr_info) != 0) {
-        syslog(LOG_ERR, "ERROR: Failed to get address");
+        syslog(LOG_ERR, "ERROR: getaddrinfo failed");
         if (server_addr_info != NULL) {
             freeaddrinfo(server_addr_info);
         }
         status = FAILURE;
         goto main_exit;
     }
-    syslog(LOG_INFO, "Address returned from getaddrinfo");
+    syslog(LOG_INFO, "Address obtained from getaddrinfo");
 
     int reuse_opt = 1;
     if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &reuse_opt, sizeof(int)) == FAILURE) {
-        syslog(LOG_ERR, "ERROR: Failed to setsockopt");
+        syslog(LOG_ERR, "ERROR: setsockopt failed");
         if (server_addr_info != NULL) {
             freeaddrinfo(server_addr_info);
         }
         status = FAILURE;
         goto main_exit;
     }
-    syslog(LOG_INFO, "Set port reuse option");
+    syslog(LOG_INFO, "Port reuse option set");
 
     if (bind(sock_fd, server_addr_info->ai_addr, server_addr_info->ai_addrlen) != SUCCESS) {
-        syslog(LOG_PERROR, "ERROR: Failed to bind");
+        syslog(LOG_ERR, "ERROR: bind failed");
         if (server_addr_info != NULL) {
             freeaddrinfo(server_addr_info);
         }
         status = FAILURE;
         goto main_exit;
     }
-    syslog(LOG_INFO, "Bind Successful");
+    syslog(LOG_INFO, "Bind successful");
 
     if (server_addr_info != NULL) {
         freeaddrinfo(server_addr_info);
-        syslog(LOG_INFO, "Memory Free");
+        syslog(LOG_INFO, "Freed server address info");
     }
 
     if (daemon_mode_enabled) {
         syslog(LOG_INFO, "Running as daemon");
         if(run_as_daemon_func() != SUCCESS) {
-            syslog(LOG_ERR, "ERROR: Failed to run as a daemon");
+            syslog(LOG_ERR, "ERROR: daemonization failed");
             status = FAILURE;
             goto main_exit;
         }
     }
 
     if (listen(sock_fd, 10) == -1) {
-        syslog(LOG_ERR, "ERROR: Failed to listen");
+        syslog(LOG_ERR, "ERROR: listen failed");
         status = FAILURE;
         goto main_exit;
     }
 
 #if (USE_AESD_CHAR_DEVICE == 0)
-    /* Spawn timestamp thread if not using the character device */
+    /* If not using char device, spawn timestamp thread */
     data_ptr = (socket_thread_t *)malloc(sizeof(socket_thread_t));
     if (data_ptr == NULL) {
-        syslog(LOG_ERR, "ERROR: Failed to malloc");
+        syslog(LOG_ERR, "ERROR: malloc failed for timestamp thread");
         status = FAILURE;
         goto main_exit;
     }
@@ -510,7 +524,7 @@ int main(int argc, char *argv[])
     data_ptr->thread_mutex = &file_mutex;
 
     if (pthread_create(&data_ptr->thread_id, NULL, timestamp_thread, data_ptr) != SUCCESS) {
-        syslog(LOG_ERR, "ERROR: Failed to create timer thread");
+        syslog(LOG_ERR, "ERROR: timestamp thread creation failed");
         free(data_ptr);
         data_ptr = NULL;
         status = FAILURE;
@@ -519,24 +533,24 @@ int main(int argc, char *argv[])
     SLIST_INSERT_HEAD(&head, data_ptr, node_count);
 #endif
 
-    /* Main server loop for handling client connections */
+    
     while(!shutdown_flag) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
         int accepted_fd = accept(sock_fd, (struct sockaddr*)&client_addr, &client_addr_len);
         if (accepted_fd == FAILURE) {
-            syslog(LOG_ERR, "ERROR: Failed to accept");
+            syslog(LOG_ERR, "ERROR: accept failed");
         } else {
-            syslog(LOG_INFO, "connection accepted: %d", accepted_fd);
+            syslog(LOG_INFO, "Connection accepted");
 
             if (inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN) == NULL) {
-                syslog(LOG_ERR, "ERROR: Failed to get ip");
+                syslog(LOG_ERR, "ERROR: inet_ntop failed to get client IP");
             }
-            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+            syslog(LOG_INFO, "Client IP: %s", client_ip);
 
             data_ptr = (socket_thread_t *)malloc(sizeof(socket_thread_t));
             if (data_ptr == NULL) {
-                syslog(LOG_ERR, "ERROR: Failed to malloc");
+                syslog(LOG_ERR, "ERROR: malloc failed for connection thread");
                 status = FAILURE;
                 goto main_exit;
             }
@@ -546,7 +560,7 @@ int main(int argc, char *argv[])
             data_ptr->thread_mutex = &file_mutex;
 
             if (SUCCESS != pthread_create(&data_ptr->thread_id, NULL, data_thread, data_ptr)) {
-                syslog(LOG_ERR, "ERROR: Failed to create connection thread");
+                syslog(LOG_ERR, "ERROR: connection thread creation failed");
                 free(data_ptr);
                 data_ptr = NULL;
                 status = FAILURE;
@@ -555,7 +569,7 @@ int main(int argc, char *argv[])
             SLIST_INSERT_HEAD(&head, data_ptr, node_count);
         }
 
-        /* Cleanup threads that have finished their work */
+        /* Cleanup finished threads */
         data_ptr = NULL;
         SLIST_FOREACH_SAFE(data_ptr, &head, node_count, data_ptr_temp) {
             if (data_ptr->thread_complete == true) {
